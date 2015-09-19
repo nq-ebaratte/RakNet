@@ -114,8 +114,6 @@ static const int mtuSizes[NUM_MTU_SIZES]={MAXIMUM_MTU_SIZE, 1200, 576};
 
 using namespace RakNet;
 
-static RakNetRandom rnr;
-
 /*
 struct RakPeerAndIndex
 {
@@ -399,11 +397,6 @@ StartupResult RakPeer::Startup( unsigned int maxConnections, SocketDescriptor *s
 
 
 	FillIPList();
-
-	if (myGuid==UNASSIGNED_RAKNET_GUID)
-	{
-		rnr.SeedMT( GenerateSeedFromGuid() );
-	}
 
 	//RakPeerAndIndex rpai[32];
 	//RakAssert(socketDescriptorCount<32);
@@ -1685,28 +1678,41 @@ void RakPeer::CloseConnection( const AddressOrGUID target, bool sendDisconnectio
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void RakPeer::CancelConnectionAttempt( const SystemAddress target )
 {
-	unsigned int i;
+	requestedConnectionCancelQueueMutex.Lock();
+	requestedConnectionCancelQueue.Push(target, _FILE_AND_LINE_ );
+	requestedConnectionCancelQueueMutex.Unlock();
+}
 
-	// Cancel pending connection attempt, if there is one
-	i=0;
-	requestedConnectionQueueMutex.Lock();
-	while (i < requestedConnectionQueue.Size())
+void RakPeer::HandleConnectionCancelQueue( )
+{
+	requestedConnectionCancelQueueMutex.Lock();
+	while (requestedConnectionCancelQueue.Size() > 0)
 	{
-		if (requestedConnectionQueue[i]->systemAddress==target)
-		{
-#if LIBCAT_SECURITY==1
-			CAT_AUDIT_PRINTF("AUDIT: Deleting requestedConnectionQueue %i client_handshake %x\n", i, requestedConnectionQueue[ i ]->client_handshake);
-			RakNet::OP_DELETE(requestedConnectionQueue[i]->client_handshake, _FILE_AND_LINE_ );
-#endif
-			RakNet::OP_DELETE(requestedConnectionQueue[i], _FILE_AND_LINE_ );
-			requestedConnectionQueue.RemoveAtIndex(i);
-			break;
-		}
-		else
-			i++;
-	}
-	requestedConnectionQueueMutex.Unlock();
+		unsigned int i;
 
+		// Cancel pending connection attempt, if there is one
+		i=0;
+		requestedConnectionQueueMutex.Lock();
+		while (i < requestedConnectionQueue.Size())
+		{
+			if (requestedConnectionQueue[i]->systemAddress==requestedConnectionCancelQueue[0])
+			{
+#if LIBCAT_SECURITY==1
+				CAT_AUDIT_PRINTF("AUDIT: Deleting requestedConnectionQueue %i client_handshake %x\n", i, requestedConnectionQueue[ i ]->client_handshake);
+				RakNet::OP_DELETE(requestedConnectionQueue[i]->client_handshake, _FILE_AND_LINE_ );
+#endif
+				RakNet::OP_DELETE(requestedConnectionQueue[i], _FILE_AND_LINE_ );
+				requestedConnectionQueue.RemoveAtIndex(i);
+				break;
+			}
+			else
+				i++;
+		}
+		requestedConnectionQueueMutex.Unlock();
+
+		requestedConnectionCancelQueue.RemoveAtIndex(0);
+	}
+	requestedConnectionCancelQueueMutex.Unlock();
 }
 
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -2559,7 +2565,7 @@ RakNet::TimeMS RakPeer::GetTimeoutTime( const SystemAddress target )
 		RemoteSystemStruct * remoteSystem = GetRemoteSystemFromSystemAddress( target, false, true );
 
 		if ( remoteSystem != 0 )
-			remoteSystem->reliabilityLayer.GetTimeoutTime();
+			return remoteSystem->reliabilityLayer.GetTimeoutTime();
 	}
 	return defaultTimeoutTime;
 }
@@ -3778,6 +3784,7 @@ void RakPeer::ShiftIncomingTimestamp( unsigned char *data, const SystemAddress &
 #endif
 
 	RakNet::BitStream timeBS( data, sizeof(RakNet::Time), false);
+        timeBS.EndianSwapBytes(0,sizeof(RakNet::Time));
 	RakNet::Time encodedTimestamp;
 	timeBS.Read(encodedTimestamp);
 
@@ -4495,31 +4502,38 @@ uint64_t RakPeerInterface::Get64BitUniqueRandomNumber(void)
 
 
 
+	uint64_t g;
 #if   defined(_WIN32)
-	uint64_t g=RakNet::GetTimeUS();
+	g = RakNet::GetTimeUS();
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	g = tv.tv_usec + tv.tv_sec * 1000000;
+#endif
 
 	RakNet::TimeUS lastTime, thisTime;
 	int j;
 	// Sleep a small random time, then use the last 4 bits as a source of randomness
-	for (j=0; j < 8; j++)
+	for (j=0; j < 4; j++)
 	{
-		lastTime = RakNet::GetTimeUS();
-		RakSleep(1);
-		RakSleep(0);
-		thisTime = RakNet::GetTimeUS();
-		RakNet::TimeUS diff = thisTime-lastTime;
-		unsigned int diff4Bits = (unsigned int) (diff & 15);
-		diff4Bits <<= 32-4;
-		diff4Bits >>= j*4;
-		((char*)&g)[j] ^= diff4Bits;
+		unsigned char diffByte = 0;
+		for (int i=0; i < 4; i++)
+		{
+			lastTime = RakNet::GetTimeUS();
+			RakSleep(1);
+			RakSleep(0);
+			thisTime = RakNet::GetTimeUS();
+			RakNet::TimeUS diff = thisTime-lastTime;
+			diffByte ^= (unsigned char) ((diff & 15) << (i * 2));
+			if (i == 3)
+			{
+				diffByte ^= (unsigned char) ((diff & 15) >> 2);
+			}
+		}
+
+		((char*)&g)[4 + j] ^= diffByte;
 	}
 	return g;
-
-#else
-	struct timeval tv;
-	gettimeofday(&tv, NULL);
-	return tv.tv_usec + tv.tv_sec * 1000000;
-#endif
 }
 // --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void RakPeer::GenerateGUID(void)
@@ -5459,7 +5473,7 @@ void ProcessNetworkPacket( SystemAddress systemAddress, const char *data, const 
 		{
 			remoteSystem->reliabilityLayer.HandleSocketReceiveFromConnectedPlayer(
 				data, length, systemAddress, rakPeer->pluginListNTS, remoteSystem->MTUSize,
-				rakNetSocket, &rnr, timeRead, updateBitStream);
+				rakNetSocket, timeRead, updateBitStream);
 		}
 	}
 	else
@@ -5497,7 +5511,7 @@ void RakPeer::DerefAllSockets(void)
 	unsigned int i;
 	for (i=0; i < socketList.Size(); i++)
 	{
-		delete socketList[i];
+		RakNet::OP_DELETE(socketList[i], _FILE_AND_LINE_);
 	}
 	socketList.Clear(false, _FILE_AND_LINE_);
 }
@@ -5688,6 +5702,8 @@ bool RakPeer::RunUpdateCycle(BitStream &updateBitStream )
 		bufferedCommands.Deallocate(bcs, _FILE_AND_LINE_);
 	}
 
+	HandleConnectionCancelQueue();
+
 	if (requestedConnectionQueue.IsEmpty()==false)
 	{
 		if (timeNS==0)
@@ -5868,7 +5884,7 @@ bool RakPeer::RunUpdateCycle(BitStream &updateBitStream )
 				}
 			}
 
-			remoteSystem->reliabilityLayer.Update( remoteSystem->rakNetSocket, systemAddress, remoteSystem->MTUSize, timeNS, maxOutgoingBPS, pluginListNTS, &rnr, updateBitStream ); // systemAddress only used for the internet simulator test
+			remoteSystem->reliabilityLayer.Update( remoteSystem->rakNetSocket, systemAddress, remoteSystem->MTUSize, timeNS, maxOutgoingBPS, pluginListNTS, updateBitStream ); // systemAddress only used for the internet simulator test
 
 			// Check for failure conditions
 			if ( remoteSystem->reliabilityLayer.IsDeadConnection() ||
